@@ -126,6 +126,7 @@ where
     Err(Error::MultipleHandlers)
 }
 
+#[cfg(not(target_os = "motor"))]
 fn set_handler_inner<F>(mut user_handler: F, overwrite: bool) -> Result<(), Error>
 where
     F: FnMut() + 'static + Send,
@@ -145,4 +146,41 @@ where
         .map_err(Error::System)?;
 
     Ok(())
+}
+
+#[cfg(target_os = "motor")]
+fn set_handler_inner<F>(mut user_handler: F, _overwrite: bool) -> Result<(), Error>
+where
+    F: FnMut() + 'static + Send,
+{
+    let (setup_tx, setup_rx) = std::sync::mpsc::sync_channel(0);
+    thread::Builder::new()
+        .name("ctrl-c".into())
+        .spawn(move || match platform::register_handler() {
+            Ok(platform::Registration::Dormant) => {
+                let _ = setup_tx.send(Ok(()));
+            }
+            Ok(platform::Registration::Active(mut last)) => {
+                if setup_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                while let Ok(next) = platform::wait(last) {
+                    for _ in last..next {
+                        user_handler();
+                    }
+                    last = next;
+                }
+            }
+            Err(error) => {
+                let _ = setup_tx.send(Err(error.into()));
+            }
+        })
+        .map_err(Error::System)?;
+
+    setup_rx.recv().unwrap_or_else(|_| {
+        Err(Error::System(std::io::Error::new(
+            std::io::ErrorKind::Other,
+            "Ctrl-C listener stopped during setup",
+        )))
+    })
 }
